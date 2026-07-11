@@ -70,3 +70,22 @@ class TinyMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+
+import torch
+import torch.nn as nn
+
+
+# RMSNorm实现
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.gamma * self._norm(x)
