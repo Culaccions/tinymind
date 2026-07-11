@@ -1,0 +1,14 @@
+[project]
+name = "tinymind"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.4",
+    "pandas>=3.0.3",
+    "torch>=2.7.1",
+    "transformers>=4.57.1",
+]
+[tool.uv]
+extra-index-url = ["https://download.pytorch.org/whl/cu118"]
