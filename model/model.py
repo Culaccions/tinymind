@@ -148,23 +148,28 @@ def precompute_freqs_cis(
     freqs = torch.outer(t, freqs).float()
 
     # 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
-    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
-    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    # 将 Cos 和 Sin 分别重复两次，得到 [θ0, θ0, θ1, θ1, θ2, θ2, θ3, θ3, ... ] 这样的向量
+    freqs_cos = torch.cos(freqs).repeat_interleave(2, dim=-1)  # 【seq_len,dim】
+    freqs_sin = torch.sin(freqs).repeat_interleave(2, dim=-1)  # 【seq_len,dim】
 
     return freqs_cos, freqs_sin
 
 
 # RoPE实现
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    def rotate_half(x):
-        return torch.cat(
-            (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
-        )
+    # 把 [x0, x1, x2, x3...] 变成 [-x1, x0, -x3, x2...]
+    def rotate_every_two(x):
+        # 将最后一个维度切分：一分为二（从偶数索引抽取x0, x2...；从奇数索引抽取x1, x3...）
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
+        # 把 x_odd 变负放前面，x_even 放后面，再利用 stack + flatten (或者 stack + view) 交错拼接回去
+        x_rotated = torch.stack((-x_odd, x_even), dim=-1)
+        return x_rotated.flatten(-2)  # 重新展开为原来的形状
 
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
-        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+        rotate_every_two(q) * sin.unsqueeze(unsqueeze_dim)
     )
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
-        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
+        rotate_every_two(k) * sin.unsqueeze(unsqueeze_dim)
     )
     return q_embed, k_embed
