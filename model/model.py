@@ -2,9 +2,11 @@ from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, Union
 import math
 from transformers.activations import ACT2FN
+from transformers import PretrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class TinyMindConfig(PretrainedConfig):
@@ -335,3 +337,154 @@ class FeedForward(nn.Module):
         x_down = self.down_proj(x_up * x_gate)
         x_out = self.dropout(x_down)
         return x_out
+
+
+# 拼接块
+class TinyMindBlock(nn.Module):
+    def __init__(self, layer_id: int, args: TinyMindConfig):
+        super().__init__()
+        self.num_attention_heads = args.num_attention_heads
+        self.hidden_size = args.hidden_size
+        self.head_dim = args.hidden_size // self.num_attention_heads
+        self.self_attn = Attention(args)
+        self.layer_id = layer_id
+        self.input_layer_norm = RMSNorm(args.hidden_size, args.rms_norm_eps)
+        self.post_attention_layer_norm = RMSNorm(args.hidden_size, args.rms_norm_eps)
+        self.ffn = FeedForward(args)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_emb: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        1. 层归一化
+        2. 自注意力
+        3. 层归一化
+        4. FFN
+        5. 层归一化
+        """
+        residual = hidden_states
+
+        hidden_states = self.input_layer_norm(hidden_states)
+        hidden_states, present_kv_cache = self.self_attn(
+            hidden_states,
+            position_emb,
+            use_cache,
+            kv_cache,
+            attn_mask,
+        )
+        hidden_states = hidden_states + residual
+
+        residual_ffn = hidden_states
+        hidden_states = self.post_attention_layer_norm(hidden_states)
+        hidden_states = self.ffn(hidden_states)
+        hidden_states = hidden_states + residual_ffn
+        return hidden_states, present_kv_cache
+
+
+# 模型
+class TinyMindModel(nn.Module):
+    def __init__(self, args: TinyMindConfig):
+        super().__init__()
+        self.vocab_size = args.vocab_size  # 词表大小
+        self.num_hidden_layers = args.num_hidden_layers  # 隐藏层数
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.dropout = nn.Dropout(args.dropout)
+        self.layers = nn.ModuleList(
+            [
+                TinyMindBlock(layer_id, args)
+                for layer_id in range(args.num_hidden_layers)
+            ]
+        )
+        self.norm = RMSNorm(args.hidden_size, args.rms_norm_eps)
+
+        # RoPE预计算
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            args.hidden_size,
+            args.max_position_embeddings,
+            args.rope_theta,
+            args.rope_scaling,
+        )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+        def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+            kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            use_cache: bool = False,
+            **kwargs,
+        ):
+            batch_size, seq_len = input_ids.shape
+            if hasattr(kv_cache, "layers"):
+                kv_cache = None
+
+            kv_cache = kv_cache or None * len(self.layers)
+            # 计算start_pos：如果存在past，则start_pos为已有past序列长度
+            start_pos = kv_cache[0][0].shape[1] if kv_cache[0] is not None else 0
+
+            hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+            position_emb = (
+                self.freqs_cos[start_pos : start_pos + seq_len],
+                self.freqs_sin[start_pos : start_pos + seq_len],
+            )
+
+            present_kv_caches = []
+
+            for layer_idx, (layer, kv_cache) in enumerate(zip(self.layers, kv_cache)):
+                hidden_states, present = layer(
+                    hidden_states,
+                    position_emb,
+                    kv_cache,
+                    use_cache,
+                    attn_mask,
+                )
+                present_kv_caches.append(present)
+            hidden_states = self.norm(hidden_states)
+            return hidden_states, present_kv_caches
+
+
+class TinyMindForCausalLM(PretrainedModel, GenerationMixin):
+    config_class = TinyMindConfig
+
+    def __init__(self, config: TinyMindConfig):
+        self.config = config
+        super().__init__(config)
+        self.model = TinyMindModel(config)
+        self.lm_head = nn.Linear(self.config.hidden_size, config.vocab_size, bias=False)
+        # 输出层的权重与输入层的权重共享
+        self.model.embed_tokens.weight = self.lm_head.weight
+        self.OUT = CausalLMOutputWithPast()
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = None,
+        **kwargs,
+    ):
+        hidden_states, kv_cache = self.model(
+            input_ids,
+            attn_mask,
+            kv_cache,
+            use_cache,
+            **kwargs,
+        )
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        self.OUT.__setitem__("last_hidden_state", hidden_states)
+        self.OUT.__setitem__("logits", logits)
+        self.OUT.__setitem__("past_key_values", kv_cache)
+        return self.OUT
