@@ -1,4 +1,9 @@
 from transformers import PretrainedConfig
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple, List, Union
+import math
 
 
 class TinyMindConfig(PretrainedConfig):
@@ -72,12 +77,6 @@ class TinyMindConfig(PretrainedConfig):
         )
 
 
-import torch
-import torch.nn as nn
-from typing import Optional, Tuple, List, Union
-import math
-
-
 # RMSNorm实现
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -118,9 +117,13 @@ def precompute_freqs_cis(
         # 推断的长度大于训练的长度时，使用缩放
         if end > orig_max:
             # 波长比b到索引i的映射
-            inv_dim = lambda b: (
-                dim * math.log(orig_max / (b * 2 * math.pi)) / 2 * math.log(rope_base)
-            )
+            def inv_dim(b):
+                return (
+                    dim
+                    * math.log(orig_max / (b * 2 * math.pi))
+                    / 2
+                    * math.log(rope_base)
+                )
 
             # 划分低频维度和高频维度
             # 0到low是高频，low到high是中间过渡，high到dim//2是低频
@@ -139,7 +142,7 @@ def precompute_freqs_cis(
                 1,
             )
 
-            freqs = freqs * (1 - ramp + ramp / factor)
+            freqs = freqs * (1 - ramp + ramp / factor) * attn_factor
 
     # 根据end生成位置索引t
     t = torch.arange(end, device=freqs.device).float()
@@ -173,3 +176,132 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         rotate_every_two(k) * sin.unsqueeze(unsqueeze_dim)
     )
     return q_embed, k_embed
+
+
+# Repeat KV
+def repeat_kv(x: torch.Tensor, rep_n: int) -> torch.Tensor:
+    # 分离batch_size, seq_len, num_key_value_heads, head_dim维度
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if rep_n == 1:
+        return x
+
+    return (
+        x[:, :, :None, :]
+        .expand(bs, slen, num_key_value_heads, rep_n, head_dim)
+        .reshape(bs, slen, num_key_value_heads * rep_n, head_dim)
+    )
+
+
+# Attention实现
+class Attention(nn.Module):
+    def __init__(self, args: TinyMindConfig):
+        super().__init__()
+        # 如果num_key_value_heads为None，就将kv head设置为q head数量
+        self.num_key_value_heads = (
+            args.num_key_value_heads
+            if args.num_key_value_heads is not None
+            else args.num_attention_heads
+        )
+        # q head需要是kv head的整数倍
+        assert self.num_key_value_heads % args.num_attention_heads == 0, (
+            f"num_key_value_heads ({self.num_key_value_heads}) must be divisible by num_attention_heads ({args.num_attention_heads})"
+        )
+
+        self.n_local_heads = args.num_attention_heads  # q head数量
+        self.n_local_kv_heads = self.num_key_value_heads  # kv head数量
+        self.rep_n = self.n_local_heads // self.n_local_kv_heads  # 重复次数
+        self.head_dim = args.hidden_size // self.n_local_heads  # 切分后每个头的维度
+        self.q_proj = nn.Linear(
+            args.hidden_size, args.n_local_heads * self.head_dim, bias=False
+        )  # q head投影层
+        self.k_proj = nn.Linear(
+            args.hidden_size, args.n_local_kv_heads * self.head_dim, bias=False
+        )  # k head投影层
+        self.v_proj = nn.Linear(
+            args.hidden_size, args.n_local_kv_heads * self.head_dim, bias=False
+        )  # v head投影层
+        self.o_proj = nn.Linear(
+            args.n_local_heads * self.head_dim, args.hidden_size, bias=False
+        )  # 输出投影层
+        self.attn_dropout = nn.Dropout(args.dropout)  # 注意力dropout层
+        self.resid_dropout = nn.Dropout(args.dropout)  # 输出dropout层
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_emb: Tuple[torch.Tensor, torch.Tensor],
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        1. 通过Wq、Wk、Wv计算q k v
+        2. 将 q k v 拆成多个头
+        3.对q k 进行RoPE编码
+        4. 对k v 进行重复
+        5. 计算注意力权重
+        6.拼接多头的输出，通过一个全连接层输出
+        """
+        # 1. 通过Wq、Wk、Wv计算q k v
+        batch_size, seq_len, _ = x.shape
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # 2. 将 q k v 拆成多个头
+        q = q.view(batch_size, seq_len, self.n_local_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        # 3. 对q k 进行RoPE编码
+        cos, sin = position_emb
+        q, k = apply_rotary_pos_emb(q, k, cos[:seq_len], sin[:seq_len])
+
+        # 4. 对k v 进行重复
+        if kv_cache is not None:
+            k = torch.cat((kv_cache[0], k), dim=1)
+            v = torch.cat((kv_cache[1], v), dim=1)
+        kv_cache = (k, v) if use_cache else None
+        q, k, v = (
+            q.transpose(1, 2),
+            repeat_kv(k, self.rep_n).transpose(1, 2),
+            repeat_kv(v, self.rep_n).transpose(1, 2),
+        )
+
+        # 5. 计算注意力权重
+        if (
+            self.flash
+            and (seq_len > 1)
+            and (kv_cache is None)
+            and (attn_mask is None or torch.all(attn_mask == 1))  # 无mask或mask全为1
+        ):
+            output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores[:, :, :, -seq_len:] += torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                diagonal=1,
+            )
+
+            if attn_mask is not None:
+                extended_attention_mask = attn_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+
+            scores = F.softmax(scores.float(), dim=-1).type_as(q)
+            scores = self.attn_dropout(scores)
+            output = scores @ v
+        # [batch_size,n_local_heads,seq_len,head_dim] -> [batch_size,seq_len,n_local_heads*head_dim]
+        output = output.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, kv_cache
