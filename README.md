@@ -1,188 +1,154 @@
-# tinymind
+# TinyMind
 
-从零开始实现的小参数量大语言模型——powered by minimind  
-**minimind模型架构：**
+从零开始实现的小参数量大语言模型，基于 minimind 项目学习。本项目旨在深入理解大语言模型的核心原理，通过手写实现每一个关键组件，帮助建立对 LLM 的直观理解。
 
+## 特性
 
+- **RMSNorm** — 高效的层归一化实现
+- **RoPE** — 旋转位置编码，支持长序列外推
+- **YARN** — 基于波长分析的位置编码缩放方法，实现上下文长度扩展
+- **GQA** — 分组查询注意力，平衡性能与显存
+- **Flash Attention** — 利用 PyTorch 原生 SDPA 加速注意力计算
+- **MoE** — 混合专家架构（可选），提升模型容量
+- **KV Cache** — 推理加速，避免重复计算
+
+## 架构概览
+
+### 模型结构
 
 ![](img/image.png)
 
-
-
-
+### MoE 模块
 
 ![](img/LLM-structure-moe.jpg)
 
+## 安装
 
+### 环境要求
 
-**RMSNorm定义:**  
-假设输入向量为 $x=(x_1,x_2,...,x_n)$,RMSNorm 的计算分为两步：
+- Python >= 3.12
+- CUDA 11.8+（推荐）
 
-1. 计算 $x_i^2$ 的平方和 $S_i=\sum_{j=1}^n x_j^2$
-2. 计算 $x_i$ 的归一化值 $x_i'=\frac{x_i}{\sqrt{\frac{S_i}{n}}+\epsilon}\gamma$  
-   其中 $\epsilon$ 是一个小的常量，用于避免除零错误，$\gamma$是缩放因子,是一个可训练的参数，默认值为 $1.0$。
+### 安装依赖
 
-**ROPE旋转位置编码：**
+```bash
+# 克隆项目
+git clone https://github.com/your-username/tinymind.git
+cd tinymind
 
-首先我们先要了解在不改变模长的情况下向量如何进行选择，我们可以使用旋转矩阵
+# 使用 uv 安装（推荐）
+uv sync
 
-$$
-R(\theta)=\begin{pmatrix}
-\cos \theta & -\sin \theta \\
-\sin \theta & \cos \theta
-\end{pmatrix}
-$$
+# 或使用 pip
+pip install -e .
+```
 
-那么选择位置编码的思想就是，如果当前词为第$m$个词，那就将它旋转$m\theta$度，如果为第$n$个词，则将它旋转$n\theta$度，这里的$\theta$是一个角度的基本单位，是一个常量。
+## 项目结构
 
-那么我们领旋转后的$q$和$k$为$q'$和$k'$，其中$q'=R(m\theta).q$，$k'=R(n\theta).k$
+````
+tinymind/
+├── model/
+│   └── model.py          # 模型定义：Config、RMSNorm、RoPE、Attention 等
+├── trainer/
+│   ├── train_pretrain.py  # 预训练脚本
+│   └── trainer_utils.py   # 训练工具函数
+├── dataset/
+│   └── lm_dataset.py      # 数据集处理
+├── img/                   # 文档图片资源
+├── main.py                # 入口文件
+└── pyproject.toml         # 项目配置
+````
 
-我们知道$(AB)^T=B^TA^T$那么新的注意力分数就为：
+## 模型配置
 
-$$
-\mathit{Score} = \left(q'\right)^T \cdot k' 
-= q^T \cdot R(m\theta)^T \cdot R(n\theta) \cdot k
-$$
+默认配置参数如下：
 
-我们将$R(m\theta)^T.R(n\theta)$展开得到：$R(\\alpha) = \\begin{pmatrix} \\cos\\alpha & -\\sin\\alpha \\\\ \\sin\\alpha & \\cos\\alpha \\end{pmatrix}$
+| 参数                      | 默认值  | 说明             |
+| ------------------------- | ------- | ---------------- |
+| `hidden_size`             | 512     | 隐藏层维度       |
+| `num_hidden_layers`       | 8       | Transformer 层数 |
+| `num_attention_heads`     | 8       | 注意力头数       |
+| `num_key_value_heads`     | 2       | KV 头数（GQA）   |
+| `vocab_size`              | 6400    | 词表大小         |
+| `max_position_embeddings` | 32768   | 最大序列长度     |
+| `rope_theta`              | 1000000 | RoPE 基础频率    |
+| `hidden_act`              | silu    | 激活函数         |
+| `rms_norm_eps`            | 1e-5    | RMSNorm epsilon  |
 
-$$
-R(m\theta)^\mathrm{T}
-=
-\begin{pmatrix}
-\cos m\theta & \sin m\theta \\
--\sin m\theta & \cos m\theta
-\end{pmatrix},\quad
-R(n\theta)
-=
-\begin{pmatrix}
-\cos n\theta & -\sin n\theta \\
-\sin n\theta & \cos n\theta
-\end{pmatrix}
-$$
+### MoE 配置
 
-其相乘后每个位置元素计算如下，结合积化和差公式可得：
+| 参数                  | 默认值 | 说明                    |
+| --------------------- | ------ | ----------------------- |
+| `use_moe`             | False  | 是否启用 MoE            |
+| `n_routed_experts`    | 4      | 路由专家数              |
+| `n_shared_experts`    | 1      | 共享专家数              |
+| `num_experts_per_tok` | 2      | 每个 token 激活的专家数 |
+| `aux_loss_alpha`      | 0.01   | 辅助损失系数            |
 
-$$
-\begin{aligned}
-C_{11}
-&= a_{11}b_{11} + a_{12}b_{21} \\
-&= \cos m\theta \cdot \cos n\theta + \sin m\theta \cdot \sin n\theta \\
-&= \cos\left(n\theta - m\theta\right) \\
-&= \cos\big((n-m)\theta\big)
-\end{aligned}
-$$
+## 技术细节
 
-$$
-\begin{aligned}
-C_{12}
-&= a_{11}b_{12} + a_{12}b_{22} \\
-&= \cos m\theta \cdot (-\sin n\theta) + \sin m\theta \cdot \cos n\theta \\
-&= -\left(\cos m\theta \sin n\theta - \sin m\theta \cos n\theta\right) \\
-&= -\sin\left(n\theta - m\theta\right) \\
-&= -\sin\big((n-m)\theta\big)
-\end{aligned}
-$$
+### RMSNorm
+
+RMSNorm 相比 LayerNorm 去除了均值中心化步骤，计算更高效：
 
 $$
-\begin{aligned}
-C_{21}
-&= a_{21}b_{11} + a_{22}b_{21} \\
-&= -\sin m\theta \cdot \cos n\theta + \cos m\theta \cdot \sin n\theta \\
-&= \sin\left(n\theta - m\theta\right) \\
-&= \sin\big((n-m)\theta\big)
-\end{aligned}
+\text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{n}\sum_{i=1}^{n}x_i^2 + \epsilon}} \cdot \gamma
 $$
 
-$$
-\begin{aligned}
-C_{22}
-&= a_{21}b_{12} + a_{22}b_{22} \\
-&= -\sin m\theta \cdot (-\sin n\theta) + \cos m\theta \cdot \cos n\theta \\
-&= \cos m\theta \cos n\theta + \sin m\theta \sin n\theta \\
-&= \cos\left(n\theta - m\theta\right) \\
-&= \cos\big((n-m)\theta\big)
-\end{aligned}
-$$
+其中 $\gamma$ 是可训练的缩放参数，$\epsilon$ 用于数值稳定性。
 
-最终结果为：
+### RoPE 旋转位置编码
+
+RoPE 通过旋转矩阵将绝对位置信息编码为相对位置信息。对于位置 $m$ 和 $n$ 的向量，注意力分数仅依赖于相对位置 $(n-m)$：
 
 $$
-R(m\theta)^\mathrm{T} R(n\theta)
-=
-\begin{pmatrix}
-\cos\left((n-m)\theta\right) & -\sin\left((n-m)\theta\right) \\
-\sin\left((n-m)\theta\right) & \cos\left((n-m)\theta\right)
-\end{pmatrix}
-= R\big((n-m)\theta\big)
+\text{Score} = q^T \cdot R((n-m)\theta) \cdot k
 $$
 
-我们发现他会等于$R((n-m)\theta)$，这样我们就得到了关于相对位置的信息，最终注意力分数就可以化简为：
-
-$$
-\mathit{Score} = \left(q'\right)^T \cdot k' 
-= q^T \cdot R(m\theta)^T \cdot R(n\theta) \cdot k=q^T.R((n-m)\theta).k
-$$
-
-上面的例子中$q$和$k$都是二维的，但是在实际中词向量的维度往往是很大的，所以RoPE采用了分治法的思想，两两位一组，每组各转各的：
+分组策略：将高维向量两两分组，每组使用不同频率 $\theta_i = 10000^{-\frac{2(i-1)}{d_{\text{model}}}}$，低维组频率快（捕获局部信息），高维组频率慢（捕获全局信息）。
 
 ![](img/rope%E5%88%86%E6%B2%BB.png)
 
-此时出现了一个问题，当我们逆时针旋转$10$度和我们逆时针旋转$370$其实没有本质的区别，那为了区分，RoPE为每一组设计了不同的$\theta$让每一组的转速都不同，组的维数越低，频率越快，组的维数越高，频率越慢。其中$\theta_i = 10000^{-\frac{2(i-1)}{d_{\mathrm{model}}}} i \in \left[1,2,\dots,\frac{d}{2}\right]$这部分借鉴了《Attention is All you need》中正余弦位置编码。
+### YARN 位置编码缩放
 
-引入不同频率之后，位置信息就由这$n$组不同的旋转向量共同表示了，即使前面的部分有重叠，但是仍然可以靠后面的向量区分出来。
+YARN 通过波长分析实现上下文长度扩展：
 
-**YARN：**
+- **波长** $\lambda_i = \frac{2\pi}{\theta_i}$：完成一次完整旋转所需的 token 距离
+- **高频维度**（$\lambda_i \ll L$）：负责局部相对位置，不缩放
+- **低频维度**（$\lambda_i \gg L$）：负责全局绝对位置，全量缩放
+- **中间维度**：线性插值过渡
 
 ![](img/YARN%E5%A4%84%E7%90%86%E6%96%B9%E6%B3%95.png)
 
-在原始 RoPE 中，位置 $m$ 对应的旋转角度为 $m⋅θ_i$。其**波长（Wavelength）** $λ_i$​ 定义为该维度完成一次完整旋转（2π）所需的 token 距离：
+### GQA（分组查询注意力）
 
-$$
-\lambda_i = \frac{2\pi}{\theta_i}=2\pi.{10000^{\frac{2(i-1)}{d_{\mathrm{model}}}}}
-$$
+GQA 将注意力头分为若干组，每组共享一对 KV head，在保持模型质量的同时显著减少 KV Cache 的显存占用：
 
-定义比率$r_i$ 来衡量波长相对于训练长度的倍数：
+- Q head 数：`num_attention_heads`（默认 8）
+- KV head 数：`num_key_value_heads`（默认 2）
+- 重复次数：`rep_n = num_attention_heads / num_key_value_heads`
 
-$$
-r_i=\frac{L}{\lambda_i}
-$$
+### Flash Attention
 
-- 当 $r_i≪1$（即 $λ_i​≫L$）时，属于**低频维度**（波长极长），负责全局绝对位置。
-- 当 $r_i≫1$（即 $λ_i​≪L$）时，属于**高频维度**（波长极短），负责局部相对位置。
+利用 PyTorch 的 `scaled_dot_product_attention` 实现硬件级注意力加速，在训练和预填充阶段自动启用。
 
-接着我们求出$i'$这里我们令$i'=i-1$
+## 使用方式
 
-$$
-r_i = \frac{L}{2\pi.{10000^{\frac{2(i-1)}{d_{\mathrm{model}}}}}}
-$$
+```bash
+# 预训练（待实现）
+python trainer/train_pretrain.py
+```
 
-$$
-{10000^{\frac{2(i-1)}{d_{\mathrm{model}}}}}=\frac{L}{2\pi.r_i}
-$$
+## 参考文献
 
-$$
-e^{\frac{2(i-1)}{d_{model}}.ln1000}=\frac{L}{2\pi.r_i}
-$$
+- [Attention Is All You Need](https://arxiv.org/abs/1706.03762) — Transformer 架构
+- [RoFormer](https://arxiv.org/abs/2104.09864) — 旋转位置编码
+- [YaRN](https://arxiv.org/abs/2309.00071) — 上下文长度扩展
+- [GQA](https://arxiv.org/abs/2305.13245) — 分组查询注意力
+- [FlashAttention](https://arxiv.org/abs/2205.14135) — 高效注意力实现
+- [Mixtral of Experts](https://arxiv.org/abs/2401.04088) — 混合专家架构
 
-$$
-\frac{2(i-1)}{d_{model}}=\frac{ln(\frac{L}{2\pi.r_i})}{ln1000}
-$$
+## License
 
-$$
-i'=\frac{d_{model}ln(\frac{L}{2\pi.r_i})}{2.ln1000}
-$$
-
-接着计算缩放因子：
-
-$$
-\gamma_i=
-\begin{cases}
-0, & i \le \mathrm{low} \\
-\dfrac{i-\mathrm{low}}{\mathrm{high}-\mathrm{low}}, & \mathrm{low} < i < \mathrm{high} \\
-1, & i \ge \mathrm{high}
-\end{cases}
-$$
-
-**GQA:**
+MIT
 

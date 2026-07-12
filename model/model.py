@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Union
 import math
+from transformers.activations import ACT2FN
 
 
 class TinyMindConfig(PretrainedConfig):
@@ -305,3 +306,32 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, kv_cache
+
+
+# FFN实现
+class FeedForward(nn.Module):
+    def __init__(self, args: TinyMindConfig):
+        super().__init__()
+        # 全连接层
+        if args.intermediate_size is None:
+            ntermediate_size = int(args.hidden_size * 8 / 3)
+            args.intermediate_size = 64 * ((ntermediate_size + 64 - 1) // 64)
+        self.up = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.dropout = nn.Dropout(args.dropout)
+        self.act_fn = ACT2FN[args.hidden_act]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        1. 升维————全连接层
+        2. 激活函数
+        3. 下降————全连接层
+        4. 门控机制
+        5. 输出
+        """
+        x_up = self.up(x)
+        x_gate = self.act_fn(self.gate_proj(x))
+        x_down = self.down_proj(x_up * x_gate)
+        x_out = self.dropout(x_down)
+        return x_out
