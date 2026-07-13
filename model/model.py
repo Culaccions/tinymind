@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, Union
 import math
 from transformers.activations import ACT2FN
-from transformers import PretrainedModel, GenerationMixin
+from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
@@ -100,7 +100,7 @@ def precompute_freqs_cis(
     dim: int, end: int, rope_base, rope_scaling: Optional[dict] = None
 ):
     # 初始化RoPE频率
-    freqs, attn_factor = (1 / rope_base ** (torch.range(0, dim, 2).float() / dim), 1.0)
+    freqs, attn_factor = 1 / (rope_base ** (torch.range(0, dim, 2).float() / dim))
 
     if rope_scaling is not None:
         # 从配置字典中提取 YaRN 的超参数
@@ -416,17 +416,17 @@ class TinyMindModel(nn.Module):
             self,
             input_ids: Optional[torch.Tensor] = None,
             attn_mask: Optional[torch.Tensor] = None,
-            kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            kv_caches: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
             use_cache: bool = False,
             **kwargs,
         ):
             batch_size, seq_len = input_ids.shape
-            if hasattr(kv_cache, "layers"):
-                kv_cache = None
+            if hasattr(kv_caches, "layers"):
+                kv_caches = None
 
-            kv_cache = kv_cache or None * len(self.layers)
+            kv_caches = kv_caches or None * len(self.layers)
             # 计算start_pos：如果存在past，则start_pos为已有past序列长度
-            start_pos = kv_cache[0][0].shape[1] if kv_cache[0] is not None else 0
+            start_pos = kv_caches[0][0].shape[1] if kv_caches[0] is not None else 0
 
             hidden_states = self.dropout(self.embed_tokens(input_ids))
 
@@ -437,7 +437,7 @@ class TinyMindModel(nn.Module):
 
             present_kv_caches = []
 
-            for layer_idx, (layer, kv_cache) in enumerate(zip(self.layers, kv_cache)):
+            for layer_idx, (layer, kv_cache) in enumerate(zip(self.layers, kv_caches)):
                 hidden_states, present = layer(
                     hidden_states,
                     position_emb,
@@ -450,7 +450,7 @@ class TinyMindModel(nn.Module):
             return hidden_states, present_kv_caches
 
 
-class TinyMindForCausalLM(PretrainedModel, GenerationMixin):
+class TinyMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = TinyMindConfig
 
     def __init__(self, config: TinyMindConfig):
@@ -460,7 +460,6 @@ class TinyMindForCausalLM(PretrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(self.config.hidden_size, config.vocab_size, bias=False)
         # 输出层的权重与输入层的权重共享
         self.model.embed_tokens.weight = self.lm_head.weight
-        self.OUT = CausalLMOutputWithPast()
 
     def forward(
         self,
@@ -484,7 +483,9 @@ class TinyMindForCausalLM(PretrainedModel, GenerationMixin):
             else logits_to_keep
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        self.OUT.__setitem__("last_hidden_state", hidden_states)
-        self.OUT.__setitem__("logits", logits)
-        self.OUT.__setitem__("past_key_values", kv_cache)
-        return self.OUT
+        output = CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=kv_cache,
+            hidden_states=hidden_states,
+        )
+        return output
